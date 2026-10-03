@@ -7,18 +7,18 @@ or shipping metrics, so it is here rather than in relay.py.
 The policy, and why each half is needed
 ---------------------------------------
 Bounded on BOTH axes: a size cap per file, and a cap on retained generations.
-Size alone lets a burst multiply files; count alone lets one quiet day produce a
-file too big to grep. Worst case on disk is max_bytes * (1 + max_files): 16 MiB *
-4 = 64 MiB by default. Under `restart: unless-stopped` an unbounded log is an
-availability problem, not a cosmetic one.
+Size alone lets a burst multiply files; count alone lets one quiet day produce
+a file too big to search. Worst case on disk is max_bytes * (1 + max_files):
+16 MiB * 4 = 64 MiB by default. Under `restart: unless-stopped` an unbounded
+log is an availability problem, not a cosmetic one.
 
 Rotation renames, never truncates
 ---------------------------------
 `os.replace` is rename(2), so a retired file keeps its inode and an open
-descriptor -- `tail -f`, a grep, a log shipper -- reads it to EOF uninterrupted.
-Truncating in place would hand that reader a file whose first bytes are now
-DIFFERENT CONTENT, which is how a log gets silently corrupted. Files appear
-oldest-last: events.log.2 -> events.log.1 -> events.log.
+descriptor -- `tail -f`, a text search, a log shipper -- reads it to EOF
+uninterrupted. Truncating in place would hand that reader a file whose first
+bytes are now DIFFERENT CONTENT, which is how a log gets silently corrupted.
+Files appear oldest-last: events.log.2 -> events.log.1 -> events.log.
 
 Losing the oldest generation is the only data loss here, and it is deliberate:
 that deletion is what makes the bound a bound.

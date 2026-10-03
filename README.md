@@ -164,8 +164,12 @@ capped, in [docker-compose.yml](docker-compose.yml):
 | `RELAY_LOG_MAX_FILES` | 3 | retired generations kept |
 
 Worst case on disk is `16 MiB × (1 + 3) = 64 MiB`. Size alone would let a burst
-multiply files; count alone would let a quiet day produce a file too big to grep.
-Both are needed.
+multiply files; count alone would let a quiet day produce a file too big to
+search. Both are needed.
+
+**Reading it:** ripgrep is in the image, so `rg -c . /state/events.log` works
+inside the container. The `grep` in there is busybox, which has no
+`--include`/`--exclude`/`--exclude-dir`.
 
 **Lowering `RELAY_LOG_MAX_FILES` used to leak files.** The rotation shift only
 touches generations it is about to *move*, so a file already past the cap was
@@ -198,11 +202,11 @@ to sit beside the knobs and call `die()`, which is defined ~300 lines below, so
 it died with `NameError` instead of reporting anything.)
 
 **Rotation renames; it never truncates.** `os.replace` is `rename(2)`, so the
-retired file keeps its inode and an open reader — `tail -f`, a grep, a shipper —
-reads it through to EOF uninterrupted. Truncating in place would hand that
-reader a file whose first bytes are now *different content*, which is how a log
-gets silently corrupted. Files appear oldest-last: `events.log.2` → `events.log.1`
-→ `events.log`.
+retired file keeps its inode and an open reader — `tail -f`, a text search, a
+shipper — reads it through to EOF uninterrupted. Truncating in place would hand
+that reader a file whose first bytes are now *different content*, which is how a
+log gets silently corrupted. Files appear oldest-last: `events.log.2` →
+`events.log.1` → `events.log`.
 
 **A reader holding the log defeats rotation, and the relay says so.** Windows
 will not rename a file with an open handle, and — measured, contrary to what I

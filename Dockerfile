@@ -14,7 +14,15 @@ FROM node:22-alpine
 # `docker stop` reaches the relay's finally block instead of being swallowed by
 # PID 1. python3 is the relay itself; curl is not needed (healthcheck is a
 # python script, not an HTTP probe).
-RUN apk add --no-cache python3 tini
+#
+# ripgrep is here because the docs describe searching a rotated events.log, and
+# the reader who does that from inside this container should not be handed a
+# busybox grep. grep itself is untouched: Alpine ships it in busybox, so it is
+# present either way and costs nothing. pgrep stays the process-table tool --
+# ripgrep has no equivalent for it, so that README sample is unaffected.
+# Pinned to the revision Alpine 3.24 ships (15.1.0-r0), so the image cannot
+# change underneath us the way `ripgrep` alone would; bump it deliberately.
+RUN apk add --no-cache python3 tini ripgrep=15.1.0-r0
 
 RUN npm install -g wrangler@4 && wrangler --version
 
