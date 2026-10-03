@@ -44,5 +44,8 @@ jobs:
       - name: Lint
         run: ruff check --select F .
 
-      - name: Test
+      - name: Test relay_lock
         run: python -m unittest relay_lock_test
+
+      - name: Test event_log
+        run: python -m unittest event_log_test
