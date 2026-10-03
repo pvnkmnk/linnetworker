@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Two operating systems, and only two. relay_lock decides whether a holder is
+# alive in a way that differs per platform -- ctypes against GetExitCodeProcess
+# on Windows, /proc/<pid>/stat field 22 everywhere else -- and the claim itself
+# leans on os.link behaving atomically. A single-OS run would leave half of
+# that untested, which is the half most likely to break silently.
+#
+# fail-fast is off so one OS failing does not cancel the other: the whole point
+# is to see whether Windows and Linux disagree.
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ubuntu ships python3, windows ships python, and the test file's
+      # documented command is `python` on the host and `python3` in the
+      # container. Installing explicitly means one spelling below works on both
+      # runners, and '3.x' tests whatever stable Python each runner ships
+      # rather than pinning one the module never claimed to target.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      # ruff ships with no requirements file in this repo, deliberately: the
+      # suite is stdlib-only so it needs nothing installed to run. ruff is the
+      # one tool that is not stdlib, so it is installed here rather than added
+      # to the repository as a dependency the image would then have to carry.
+      - name: Install ruff
+        run: python -m pip install --upgrade ruff
+
+      - name: Lint
+        run: ruff check --select F .
+
+      - name: Test
+        run: python -m unittest relay_lock_test
