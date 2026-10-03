@@ -518,8 +518,16 @@ and a host needs it on PATH:
 
 ```bash
 python -m pip install --upgrade ruff
-ruff check --select F .
+ruff check --select E,F .
 ```
+
+`F` alone is pyflakes -- undefined names, unused imports -- and it cannot
+see a line that is too long. Three over-long lines in `relay.py` and
+`health.py` sat here while the gate called the repo clean on both operating
+systems, on every run. `E` adds that class, and nothing about layout: ruff
+ships the blank-line, whitespace and indentation checks as preview only.
+Keep the selection here identical to the one in CI, or a green run at your
+desk says nothing about the one that gates the merge.
 
 [.github/workflows/ci.yml](.github/workflows/ci.yml) runs that lint and then
 the three suites on `ubuntu-latest` and `windows-latest`, `fail-fast: false`
