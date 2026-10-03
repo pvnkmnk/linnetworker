@@ -385,6 +385,7 @@ class ContentionTests(LockTestCase):
         # stale reclaim, not contention, and passes for the wrong reason.
         racers = 6
         gate = os.path.join(self.dir.name, "gate")
+        won = os.path.join(self.dir.name, "won")
         code = (
             "import os,sys,time\n"
             "sys.path.insert(0, %r)\n"
@@ -395,28 +396,64 @@ class ContentionTests(LockTestCase):
             "except R.LockHeld as exc:\n"
             "    print(str(exc), flush=True)\n"
             "    sys.exit(3)\n"
+            # Only a racer that believes it WON reaches this line, and it says
+            # so before it settles down to wait: an empty file named for its
+            # own pid. That is what makes a broken claim cheap to catch.
+            # Without the announcement the parent can see only that several
+            # children are still alive, and since the winner does not exit
+            # until it is released, "several still alive" is both what a
+            # broken claim produces and what a healthy race passes through on
+            # the way to one. The two are indistinguishable until the deadline
+            # expires, so the only honest move left was to spend all 60 seconds
+            # of it before believing the failure.
+            "open(%r + '.%%d' %% os.getpid(), 'wb').close()\n"
             "deadline = time.monotonic() + 60\n"
             "while not os.path.exists(%r) and time.monotonic() < deadline:\n"
             "    time.sleep(0.02)\n"
             "sys.exit(0)\n" % (os.path.dirname(os.path.abspath(__file__)),
-                               self.path, gate)
+                               self.path, won, gate)
         )
         children = [subprocess.Popen([sys.executable, "-c", code],
                                      stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE)
                     for _ in range(racers)]
 
-        # Release the winner only once it is the last one still running, so
-        # every refusal was decided against a live holder.
-        deadline = time.monotonic() + 60
-        while time.monotonic() < deadline:
-            if sum(1 for c in children if c.poll() is None) == 1:
-                break
-            time.sleep(0.02)
-        else:
+        def announced():
+            """The pids that have announced a claim, from the files they left."""
+            prefix = os.path.basename(won) + "."
+            try:
+                names = os.listdir(self.dir.name)
+            except OSError:
+                return set()
+            return {n[len(prefix):] for n in names if n.startswith(prefix)}
+
+        def stop():
             for child in children:
                 child.kill()
-            self.fail("racers never settled to one survivor")
+                child.wait()
+
+        # Release the winner only once it is the last one still running, so
+        # every refusal was decided against a live holder. A second claim is a
+        # failure the moment it appears -- there is nothing left to wait for,
+        # because the invariant is already broken. The deadline below is no
+        # longer what catches a broken claim; it is a valve for a racer that
+        # wedges without claiming or refusing, which is a different failure and
+        # earns a shorter leash now that nothing else needs the time.
+        deadline = time.monotonic() + 30
+        while True:
+            claimed = announced()
+            if len(claimed) > 1:
+                stop()
+                self.fail("the claim was not exclusive: %d starters reported "
+                          "holding it, pids %s" % (len(claimed),
+                                                    sorted(claimed)))
+            live = sum(1 for c in children if c.poll() is None)
+            if len(claimed) == 1 and live == 1:
+                break
+            if time.monotonic() >= deadline:
+                stop()
+                self.fail("racers never settled to one survivor")
+            time.sleep(0.02)
 
         open(gate, "w").close()
         codes, refusals = [], []
