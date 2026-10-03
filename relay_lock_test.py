@@ -383,98 +383,115 @@ class ContentionTests(LockTestCase):
         # earlier version of this test let each winner exit immediately, and
         # every "loser" then correctly reclaimed a dead holder -- which measures
         # stale reclaim, not contention, and passes for the wrong reason.
-        racers = 6
-        gate = os.path.join(self.dir.name, "gate")
-        won = os.path.join(self.dir.name, "won")
-        code = (
-            "import os,sys,time\n"
-            "sys.path.insert(0, %r)\n"
-            "import relay_lock as R\n"
-            "R.LOCK_PATH = %r\n"
-            "try:\n"
-            "    R.acquire_lock()\n"
-            "except R.LockHeld as exc:\n"
-            "    print(str(exc), flush=True)\n"
-            "    sys.exit(3)\n"
-            # Only a racer that believes it WON reaches this line, and it says
-            # so before it settles down to wait: an empty file named for its
-            # own pid. That is what makes a broken claim cheap to catch.
-            # Without the announcement the parent can see only that several
-            # children are still alive, and since the winner does not exit
-            # until it is released, "several still alive" is both what a
-            # broken claim produces and what a healthy race passes through on
-            # the way to one. The two are indistinguishable until the deadline
-            # expires, so the only honest move left was to spend all 60 seconds
-            # of it before believing the failure.
-            "open(%r + '.%%d' %% os.getpid(), 'wb').close()\n"
-            "deadline = time.monotonic() + 60\n"
-            "while not os.path.exists(%r) and time.monotonic() < deadline:\n"
-            "    time.sleep(0.02)\n"
-            "sys.exit(0)\n" % (os.path.dirname(os.path.abspath(__file__)),
-                               self.path, won, gate)
-        )
+        #
+        # Every racer is released from a barrier and they race again on the next
+        # round, and both halves of that are load-bearing. Started staggered, as
+        # they used to be, six of them arrive at the claim milliseconds apart and
+        # never overlap inside it, so swapping the atomic link for an
+        # exists-then-replace check passed with all six: processes that never
+        # overlap cannot both see an absent lock. The barrier is a pipe rather
+        # than a file the children poll, because polling reintroduces the very
+        # skew it is meant to remove. One round is not enough on its own -- two
+        # racers landing in the same microsecond is still a coin flip -- so the
+        # children are spawned once and re-raced, which costs one import rather
+        # than one import per round.
+        #
+        # A winner announces itself with a file named for its round and pid, so
+        # a second claim is a failure the instant it appears rather than
+        # something inferred from "several children are still alive" after a
+        # deadline has run out.
+        racers = 12
+        rounds = 8
+        d = self.dir.name
+        lines = [
+            "import os,sys,time",
+            "sys.path.insert(0, %r)" % os.path.dirname(os.path.abspath(__file__)),
+            "import relay_lock as R",
+            "d = %r" % d,
+            "for r in range(%d):" % rounds,
+            "    R.LOCK_PATH = os.path.join(d, 'lock.%d' % r)",
+            "    sys.stdin.buffer.read(1)",
+            "    try:",
+            "        R.acquire_lock()",
+            "    except R.LockHeld as exc:",
+            "        open(os.path.join(d, 'lose.%d.%d' % (r, os.getpid())),"
+            " 'w', encoding='utf-8').write(str(exc))",
+            "        continue",
+            "    open(os.path.join(d, 'won.%d.%d' % (r, os.getpid())),"
+            " 'wb').close()",
+            "    while not os.path.exists(os.path.join(d, 'done.%d' % r)):",
+            "        time.sleep(0.001)",
+            "    R.release_lock()",
+        ]
+        code = "\n".join(lines)
         children = [subprocess.Popen([sys.executable, "-c", code],
+                                     stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE)
                     for _ in range(racers)]
 
-        def announced():
-            """The pids that have announced a claim, from the files they left."""
-            prefix = os.path.basename(won) + "."
+        def marked(kind, rnd):
+            """The pids that marked round `rnd` as `kind`, by the files they left."""
+            prefix = "%s.%d." % (kind, rnd)
             try:
-                names = os.listdir(self.dir.name)
+                names = os.listdir(d)
             except OSError:
                 return set()
             return {n[len(prefix):] for n in names if n.startswith(prefix)}
 
         def stop():
-            for child in children:
-                child.kill()
-                child.wait()
+            for proc in children:
+                proc.kill()
+                proc.wait()
 
-        # Release the winner only once it is the last one still running, so
-        # every refusal was decided against a live holder. A second claim is a
-        # failure the moment it appears -- there is nothing left to wait for,
-        # because the invariant is already broken. The deadline below is no
-        # longer what catches a broken claim; it is a valve for a racer that
-        # wedges without claiming or refusing, which is a different failure and
-        # earns a shorter leash now that nothing else needs the time.
-        deadline = time.monotonic() + 30
-        while True:
-            claimed = announced()
-            if len(claimed) > 1:
-                stop()
-                self.fail("the claim was not exclusive: %d starters reported "
-                          "holding it, pids %s" % (len(claimed),
-                                                    sorted(claimed)))
-            live = sum(1 for c in children if c.poll() is None)
-            if len(claimed) == 1 and live == 1:
-                break
-            if time.monotonic() >= deadline:
-                stop()
-                self.fail("racers never settled to one survivor")
-            time.sleep(0.02)
+        winners = {}
+        for rnd in range(rounds):
+            for proc in children:
+                proc.stdin.write(b"x")
+                proc.stdin.flush()
 
-        open(gate, "w").close()
-        codes, refusals = [], []
-        for child in children:
-            out, err = child.communicate(timeout=60)
-            if child.returncode not in (0, 3):
-                self.fail("a starter exited %d, which is neither a claim nor a "
-                          "refusal: %s" % (child.returncode,
-                                           err.decode("utf-8", "replace")))
-            codes.append(child.returncode)
-            if child.returncode == 3:
-                refusals.append(out.decode("utf-8", "replace").strip())
+            deadline = time.monotonic() + 30
+            while True:
+                won, lost = marked("won", rnd), marked("lose", rnd)
+                if len(won) > 1:
+                    stop()
+                    self.fail("the claim was not exclusive: round %d of %d, "
+                              "%d starters reported holding it, pids %s"
+                              % (rnd, rounds, len(won), sorted(won)))
+                if len(won) == 1 and len(lost) == racers - 1:
+                    break
+                for proc in children:
+                    if proc.poll() not in (None, 0):
+                        out, err = proc.communicate()
+                        self.fail("a starter exited %d during round %d: %s"
+                                  % (proc.returncode, rnd,
+                                     err.decode("utf-8", "replace")))
+                if time.monotonic() >= deadline:
+                    stop()
+                    self.fail("round %d never settled: %d winners, %d refusals "
+                              "of %d expected"
+                              % (rnd, len(won), len(lost), racers - 1))
+                time.sleep(0.001)
 
-        self.assertEqual(codes.count(0), 1,
-                         "expected exactly one winner, got %r" % codes)
-        self.assertEqual(codes.count(3), racers - 1)
-        entry, present = relay_lock._lock_view()
-        self.assertTrue(present, "the winner's claim should outlive the race")
-        for message in refusals:
-            self.assertIn(str(entry["pid"]), message)
+            winner = next(iter(won))
+            winners[rnd] = winner
+            self.use_lock(os.path.join(d, "lock.%d" % rnd))
+            entry, present = relay_lock._lock_view()
+            self.assertTrue(present,
+                            "the winner's claim should outlive the round")
+            self.assertEqual(str(entry["pid"]), winner)
+            open(os.path.join(d, "done.%d" % rnd), "wb").close()
 
+        for proc in children:
+            out, err = proc.communicate(timeout=30)
+            self.assertEqual(proc.returncode, 0,
+                             "a starter exited %d: %s"
+                             % (proc.returncode, err.decode("utf-8", "replace")))
 
+        for rnd in range(rounds):
+            for name in sorted(marked("lose", rnd)):
+                with open(os.path.join(d, "lose.%d.%s" % (rnd, name)),
+                          "r", encoding="utf-8") as fh:
+                    self.assertIn(winners[rnd], fh.read())
 if __name__ == "__main__":
     unittest.main(verbosity=2)
