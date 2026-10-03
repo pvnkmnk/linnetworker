@@ -1,4 +1,4 @@
-# cf-worker-relay
+# linnetworker
 
 Cloudflare Worker observability → local Grafana.
 
@@ -14,6 +14,10 @@ in `djinn-netrunner` (`ops/linear-webhook`) and the relay must keep tailing
 while that whole stack is down, so neither belongs inside the other:
 `RELAY_WORKER_DIR` in [docker-compose.yml](docker-compose.yml) mounts that
 checkout read-only at `/worker`, and nothing else crosses the boundary.
+
+The repository is `linnetworker`; the container, image and compose project are
+still `cf-worker-relay`, which is what they have always been called and what
+every health check and `docker` command in this README uses.
 
 *Why this exists* lives in [`relay.py`](relay.py)'s module docstring, next to the
 code. This file is only what you need to run and operate it.
@@ -61,7 +65,7 @@ the health probe down exactly when the configuration is wrong.
 ## Run it as a service
 
 ```bash
-cd cf-worker-relay                # this directory is the repository root
+cd linnetworker                   # this directory is the repository root
 docker compose up -d --build     # start
 docker compose ps                # status, incl. health
 docker logs -f cf-worker-relay   # relay stdout
