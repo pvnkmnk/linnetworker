@@ -3,8 +3,13 @@ name: ci
 on:
   push:
     branches: [main]
+  # Deliberately unfiltered. A `branches: [main]` filter here does not mean
+  # "only check PRs into main" -- it means a PR targeting ANY other branch
+  # gets no run at all, silently. That is not hypothetical: the PR that added
+  # event_log_test.py targets ci-workflow, and its first push produced no
+  # workflow run whatsoever, which would have made a green tick on a stacked
+  # PR impossible to trust. A pushed branch already has its own push run.
   pull_request:
-    branches: [main]
 
 # Two operating systems, and only two. relay_lock decides whether a holder is
 # alive in a way that differs per platform -- ctypes against GetExitCodeProcess
