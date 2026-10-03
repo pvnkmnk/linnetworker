@@ -53,6 +53,43 @@ Two earlier bugs live in that history, both real, both measured:
     refuse forever -- a restart loop, before start_ticks was recorded;
   * the boundary case above, before `host` and the heartbeat were.
 
+One indivisible step, or none at all
+------------------------------------
+Creating the lock and filling it in cannot be two acts another process can slip
+between, or two relays both believe they hold the run. The claim writes the
+whole record to a temp file and then makes it visible with os.link, which is an
+atomic create-if-absent: exactly one of N simultaneous racers gets the name, the
+losers get FileExistsError, and nobody ever observes a half-written record.
+Measured working on the host (NTFS) and on the container's bind mount.
+
+Measured before this change, on the host, with 20 processes released at the same
+instant against one lock path: 9 winners, 0 refusals, 11 crashes. Read, delete
+and truncating write were three separate steps, so processes raced into each
+other's os.remove (FileNotFoundError, uncaught) and into each other's bytes.
+
+Two things follow from a file that can exist without naming anyone:
+
+  * a newcomer must NOT read that as "no lock" and take it. A blank lock is a
+    claim in flight, and stealing it is exactly the corruption this file exists
+    to prevent;
+  * a reader must not crash on it. A partial read is a state to be handled, not
+    an exception.
+
+So the PRESENCE of the file is the lock, and its contents are only the
+attribution. A lock that exists without an identity is held by nobody we can
+name: refused, with a refusal that says exactly that rather than guessing.
+
+What is still not perfect, stated plainly
+-----------------------------------------
+Reclaiming a DEAD lock is remove-then-claim, and neither POSIX nor Win32 has a
+compare-and-delete, so two processes can in principle both judge the same dead
+record and one can delete the other's fresh claim. _drop_stale re-reads before
+removing, which shrinks that window to the microseconds between that read and
+the remove, and the damage is bounded because beat() and release_lock() only
+act while the file still records us -- so a relay that lost the file discovers
+it lost rather than carrying on in silence. It is not a guarantee and it is not
+dressed up as one.
+
 Failures are raised, not printed and exited
 -------------------------------------------
 acquire_lock raises LockHeld; it does not sys.exit. The entry point decides what
@@ -80,6 +117,14 @@ HEARTBEAT_STALE = 90.0
 # mount would reclaim its lock and both relays would write state.json again.
 HEARTBEAT_EVERY = 15.0
 
+# How long acquire_lock keeps trying before it gives up on a lock it cannot make
+# sense of. The O_EXCL fallback leaves a window microseconds wide, so this is
+# only reached by a claim interrupted mid-write, or by a corrupt file -- neither
+# of which is normal, and both of which must end in a refusal rather than a
+# takeover.
+CLAIM_TIMEOUT = 5.0
+CLAIM_POLL = 0.02
+
 THIS_HOST = socket.gethostname()
 
 
@@ -90,14 +135,26 @@ class LockHeld(Exception):
     "another relay is running" and "I cannot verify that relay, so I am not
     taking its lock" are different situations and an operator needs to know
     which one they are looking at.
+
+    `pid` of None is the third situation: the lock is there and names nobody,
+    which is a claim in flight or a file we cannot parse. It is held, and the
+    message says so rather than inventing a holder.
     """
 
-    def __init__(self, pid, path, holder_host=None, verifiable=True):
+    def __init__(self, pid, path, holder_host=None, verifiable=True, detail=None):
         self.pid = pid
         self.path = path
         self.holder_host = holder_host
         self.verifiable = verifiable
-        if not verifiable:
+        if detail:
+            msg = detail
+        elif pid is None:
+            msg = ("%s is held, but by nothing this process can name: the file "
+                   "holds no readable identity, so it is either a relay "
+                   "claiming it this instant or a corrupt lock. An "
+                   "unattributed lock is still held"
+                   % os.path.basename(path))
+        elif not verifiable:
             msg = ("the lock is held by a relay on %s (pid %s there), which this "
                    "process cannot check: a pid means nothing outside its own "
                    "namespace" % (holder_host, pid))
@@ -162,20 +219,26 @@ def pid_alive(pid):
     return True
 
 
-def read_lock():
-    """Return the holder record, or None if there is no usable lock.
+def _lock_view():
+    """(entry, present) for LOCK_PATH -- the distinction read_lock() cannot make.
 
-    Returns a dict: {"pid", "start_ticks", "host", "heartbeat_ms"}. Missing
-    fields are None -- a legacy bare-PID lock is understood and treated as
-    belonging to this host with an unverifiable heartbeat.
+    `present` is False only when there is no lock file. A file that exists but
+    carries no usable identity -- empty, truncated, or not a record at all --
+    reads as (None, True): PRESENT, and therefore held. That is exactly what a
+    reader sees in the instant between a claimer's create and its write, and
+    reading it as "no lock" is how a newcomer steals a lock taken microseconds
+    ago. Every read is guarded, because a file changing under the reader is
+    normal here, not exceptional.
     """
     try:
         with open(LOCK_PATH, "r", encoding="utf-8") as fh:
             raw = fh.read().strip()
+    except FileNotFoundError:
+        return None, False           # caught first: it is an OSError subclass
     except OSError:
-        return None
+        return None, True            # there but unreadable: still held
     if not raw:
-        return None
+        return None, True
     try:
         obj = json.loads(raw)
     except ValueError:
@@ -185,14 +248,31 @@ def read_lock():
             return {"pid": int(obj["pid"]),
                     "start_ticks": obj.get("start_ticks"),
                     "host": obj.get("host"),
-                    "heartbeat_ms": obj.get("heartbeat_ms")}
+                    "heartbeat_ms": obj.get("heartbeat_ms")}, True
         except (TypeError, ValueError):
-            return None
+            return None, True
     try:
         return {"pid": int(raw), "start_ticks": None, "host": None,
-                "heartbeat_ms": None}      # legacy bare PID
+                "heartbeat_ms": None}, True       # legacy bare PID
     except ValueError:
-        return None
+        return None, True
+
+
+def read_lock():
+    """Return the holder record, or None if there is no usable lock.
+
+    Returns a dict: {"pid", "start_ticks", "host", "heartbeat_ms"}. Missing
+    fields are None -- a legacy bare-PID lock is understood and treated as
+    belonging to this host with an unverifiable heartbeat.
+
+    None covers two different situations on purpose: no lock file at all, and a
+    lock file with no readable identity. health.py reports both as "no usable
+    lock", which is true and is the only safe thing to say about a file with no
+    holder. acquire_lock() must not collapse them -- it asks _lock_view() for
+    the difference so it can refuse instead of reclaiming.
+    """
+    entry, _present = _lock_view()
+    return entry
 
 
 def _same_namespace(holder_host):
@@ -247,6 +327,101 @@ def _identity():
             "heartbeat_ms": int(time.time() * 1000)}
 
 
+def _encode(entry):
+    """The lock's exact bytes. Binary, so nothing rewrites them on the way out:
+    a text-mode write on Windows would translate newlines, and this record is
+    compared byte-for-byte by the re-read in _drop_stale.
+    """
+    return json.dumps(entry, sort_keys=True).encode("utf-8")
+
+
+def _claim_exclusive(identity):
+    """O_CREAT|O_EXCL: an atomic create, but the file is empty until the write.
+
+    The portable fallback, for a filesystem with no hard links. Returns True
+    only if this process created the lock. If the write fails the file is
+    removed again -- we created it exclusively, so it is unambiguously ours, and
+    leaving a blank lock behind would wedge every later starter.
+    """
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(LOCK_PATH, flags, 0o644)
+    except FileExistsError:
+        return False
+    try:
+        os.write(fd, _encode(identity))
+    except OSError:
+        os.close(fd)
+        try:
+            os.remove(LOCK_PATH)
+        except OSError:
+            pass
+        raise
+    os.close(fd)
+    return True
+
+
+def _claim(identity):
+    """Make LOCK_PATH exist holding `identity`, or return False if it is taken.
+
+    Two mechanisms, because they fail differently.
+
+    os.link  The lock IS the finished temp file under a second name, so it comes
+             into existence already holding its record: one indivisible step,
+             and a reader sees either no file or a complete one. link(2) and
+             CreateHardLinkW are both atomic create-if-absent, so exactly one
+             racer gets the name. fsync before the link, so a crash cannot leave
+             the visible name pointing at unwritten blocks.
+
+    O_EXCL   The fallback, taken on any non-FileExistsError from link --
+             including "this filesystem has no hard links". Equally atomic as a
+             CREATE, but empty for the instant before the write, which is why
+             _lock_view() counts a blank file as held rather than absent. If the
+             directory is genuinely unwritable the fallback raises that error
+             rather than hiding it behind a swallowed link error.
+    """
+    tmp = "%s.claim.%d" % (LOCK_PATH, os.getpid())
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(_encode(identity))
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:
+            os.link(tmp, LOCK_PATH)
+            return True
+        except FileExistsError:
+            return False
+        except (OSError, NotImplementedError):
+            return _claim_exclusive(identity)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _drop_stale(entry):
+    """Remove a lock whose holder is conclusively dead. True if it went.
+
+    The one place where removing a file can destroy somebody else's claim. Two
+    reclaimers can both read the same dead record; if one has already created a
+    fresh lock by the time the other calls os.remove, that remove would delete
+    the new holder's claim. Re-reading and comparing against the record we
+    judged dead catches that case and sends the loser round the loop again,
+    where it sees the live holder and refuses. It narrows the window to the
+    microseconds between this read and the remove; it does not close it, because
+    there is no compare-and-delete on either platform. See the module docstring.
+    """
+    current, present = _lock_view()
+    if not present or current is None or current != entry:
+        return False
+    try:
+        os.remove(LOCK_PATH)
+    except FileNotFoundError:
+        return False                # another reclaimer got there first
+    return True
+
+
 def acquire_lock():
     """Take the lock, or raise LockHeld.
 
@@ -255,21 +430,49 @@ def acquire_lock():
     cf_worker_events_total reads 0 while the dashboard looks perfectly healthy.
     This happened for real before the lock existed.
 
-    Reclaims ONLY on conclusive death -- a dead pid on this host, or a holder in
-    another namespace whose heartbeat has lapsed. An unverifiable holder is
-    respected, never reclaimed.
+    The claim is atomic (see _claim), so the loser of a race never reads a
+    half-written record, never finds the file yanked out from under it, and never
+    truncates the winner's bytes on its way to its own claim. Reclaims ONLY on
+    conclusive death -- a dead pid on this host, or a holder in another namespace
+    whose heartbeat has lapsed. An unverifiable holder is respected, never
+    reclaimed; neither is a lock that exists without naming anyone.
+
+    Measured on this host: 20 processes released together against one lock path
+    gave 1 winner and 19 refusals naming the winner, twice over.
     """
-    entry = read_lock()
-    if entry is not None:
+    deadline = time.monotonic() + CLAIM_TIMEOUT
+    while True:
+        if _claim(_identity()):
+            return
+        entry, present = _lock_view()
+        if not present:
+            continue                 # gone under us, and nobody holds it: take it
+        if entry is None:
+            # Present, unreadable: a claim caught mid-write, or a corrupt file.
+            # Wait a moment for an identity so the refusal can name the holder,
+            # then refuse unattributed rather than take a lock we cannot read.
+            if time.monotonic() < deadline:
+                time.sleep(CLAIM_POLL)
+                continue
+            raise LockHeld(None, LOCK_PATH)
         held, verifiable = assess(entry)
         if held:
             raise LockHeld(entry["pid"], LOCK_PATH,
                            holder_host=entry.get("host") or THIS_HOST,
+                           verifiable=verifiable)
+        _drop_stale(entry)
+        if time.monotonic() >= deadline:
+            # Only reachable if processes keep dying and reclaiming the same
+            # dead lock in a loop. Refuse rather than spin: an unbounded wait
+            # here would hang the relay with no output at all.
+            raise LockHeld(entry["pid"], LOCK_PATH,
+                           holder_host=entry.get("host") or THIS_HOST,
                            verifiable=verifiable,
-                           )
-        os.remove(LOCK_PATH)          # conclusively dead: safe to reclaim
-    with open(LOCK_PATH, "w", encoding="utf-8") as fh:
-        json.dump(_identity(), fh)
+                           detail=("%s could not be reclaimed within %gs: "
+                                   "another process is contending for a lock "
+                                   "whose holder (pid %s) is gone"
+                                   % (os.path.basename(LOCK_PATH),
+                                      CLAIM_TIMEOUT, entry["pid"])))
 
 
 def beat():

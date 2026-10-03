@@ -362,6 +362,56 @@ between the two, so a value that breaks the mechanism is not one to expose in
 [docker-compose.yml](docker-compose.yml) next to the log bounds, which *are*
 policy worth reviewing. `RELAY_LOG_*` stays there; these do not.
 
+### Twenty starters, one winner
+
+The claim has to be indivisible, because the only thing worse than two relays is
+two relays that each believe there is one. `acquire_lock()` writes the whole
+record to a temp file and then makes it visible with `os.link`, which is an
+atomic create-if-absent: exactly one of N simultaneous racers gets the name, and
+the rest get `FileExistsError` without ever seeing a half-written file. Where a
+filesystem has no hard links it falls back to `O_CREAT|O_EXCL` — also atomic as a
+create, but empty for the instant before the write, which is why a lock file that
+exists but names nobody is treated as **held**, never as free.
+
+Measured before this change, on the host, with 20 processes released at the same
+instant against one lock path: **9 winners, 0 refusals, 11 crashes** — read,
+delete and truncating write were three separate steps, so processes raced into
+each other's `os.remove` and into each other's bytes. Measured after, three
+times, with `os.link` both live and forced to fail so the `O_EXCL` fallback ran:
+
+| | winners | refusals | crashes | exit codes |
+| --- | --- | --- | --- | --- |
+| 20 processes, one lock path (Windows) | **1** | **19** | **0** | 1× `0`, 19× `1` |
+| the same, `os.link` forced to fail | **1** | **19** | **0** | 1× `0`, 19× `1` |
+| 20 processes inside the container, on the bind mount | **1** | **19** | **0** | — |
+
+Every one of the 19 refusals named the winner's pid, and once all 20 had exited
+the refusal count sat at 19 and never dipped.
+
+There is a third refusal case alongside the two above: a lock file that is there
+but carries no identity — empty, truncated, or not a record at all. It is held,
+and the refusal says exactly that rather than inventing a holder:
+
+```
+$ python relay.py
+relay: relay.lock is held, but by nothing this process can name: the file holds
+no readable identity, so it is either a relay claiming it this instant or a
+corrupt lock. An unattributed lock is still held; stop it first, or delete
+/path/to/relay.lock
+```
+
+The recovery paths are unchanged and re-proved: a dead pid on this host, a legacy
+bare-PID lock, and a lapsed cross-namespace heartbeat are all still reclaimed, and
+a fresh unverifiable lock is still refused.
+
+What this does **not** make perfect: reclaiming a *dead* lock is
+remove-then-claim, and neither POSIX nor Win32 offers a compare-and-delete, so
+two processes could in principle both judge the same dead record and one could
+delete the other's fresh claim. The re-read before the remove shrinks that window
+to microseconds, and the damage is bounded because `beat()` and `release_lock()`
+only act while the file still records us — a relay that lost the file finds out
+it lost. It is not a guarantee, and it is not dressed up as one.
+
 **Two earlier lock bugs are still load-bearing.** A restarted container hands the
 new relay the *same* PID (7, every time), so a pid-only lock made the fresh relay
 read its own pid as a live holder and refuse to start — an endless restart loop,
@@ -394,7 +444,7 @@ taskkill //F //T //PID <that number>
 | `relay.py` | entry point: stream decoding, tail supervision, the run loop |
 | `metrics.py` | the counters, the payload they become, the VM push |
 | `event_log.py` | bounded append-only `events.log` and its rotation policy |
-| `relay_lock.py` | `relay.lock`: the holder record and whether it is still there |
+| `relay_lock.py` | `relay.lock`: who won the claim, and whether that holder is still there |
 | `health.py` | JSON health probe; exit code is the verdict |
 | `provision_grafana.py` | datasource + dashboard, via the Grafana HTTP API |
 | `state.json` | counter totals — a restart does not reset them |

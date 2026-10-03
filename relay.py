@@ -221,7 +221,11 @@ def run(seconds=0):
         # The refusal has to distinguish "definitely another relay" from "a
         # holder I cannot check", because the operator's next action differs:
         # stop that relay, versus confirm it is gone and delete the lock.
-        if exc.verifiable:
+        if exc.verifiable or exc.pid is None:
+            # An unattributed lock (pid None) belongs in this branch too: "stop it
+            # first, or delete it by hand" is the right advice for a wedged or
+            # corrupt lock, while the heartbeat advice below is not -- there is no
+            # holder whose heartbeat could lapse.
             die("%s; stop it first, or delete %s" % (exc, exc.path))
         die("%s.\n  Refusing rather than reclaiming: a lock that cannot be "
             "attributed is still held. If you are certain that relay on %s is "

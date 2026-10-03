@@ -7,6 +7,10 @@ events.log
 events.log.*
 tail.err
 relay.lock
+# The claim and heartbeat temporaries sit beside it and are named per-pid, so a
+# bare `relay.lock` line does not cover them -- same trap as events.log.*.
+relay.lock.tmp
+relay.lock.claim.*
 __pycache__/
 
 # Holds GRAFANA_AUTH -- a live Grafana admin password. Never commit it.
