@@ -139,6 +139,14 @@ Two consequences worth knowing:
 - **`docker compose stop` is graceful.** `tini` forwards SIGTERM, the relay's
   handler exits 143, `finally` runs, exit code is 143, and `relay.lock` is
   removed. Confirmed, not assumed.
+- **Shutdown kills the tail's whole process tree, not just `npx`.** The direct
+  child is `npx`, which spawns `node` as a grandchild; terminating only the
+  child left that grandchild running — measured at **3 leaked processes per
+  foreground run**, 129 of them accumulated, each holding `tail.err` and a
+  Cloudflare tail connection. On POSIX the child gets its own session and the
+  group is signalled; on Windows `taskkill /T` walks the tree, and it has to run
+  *before* the parent dies or the grandchild is orphaned and unreachable. Three
+  consecutive foreground runs now leave **zero** survivors.
 
 State files (`state.json`, `events.log`, `tail.err`, `relay.lock`) are bind
 -mounted from this directory rather than kept in a Docker volume, so counters

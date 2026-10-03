@@ -139,11 +139,16 @@ def start_tail(errlog):
 
     stderr goes to a FILE, never PIPE: wrangler chatters on stderr and an unread
     pipe fills its buffer and deadlocks the child.
+
+    `start_new_session` puts the child in its OWN process group, so stop_tail can
+    signal the whole tree at once. Without it a signal reaches only npx and the
+    node process npx spawned survives.
     """
     proc = subprocess.Popen(
         ["npx", "wrangler", "tail", metrics.CF_WORKER, "--format", "json"],
         cwd=WORKER_DIR, stdout=subprocess.PIPE, stderr=errlog,
         bufsize=1, universal_newlines=True, encoding="utf-8", errors="replace",
+        **({"start_new_session": True} if os.name != "nt" else {}),
     )
     q = queue.Queue()
 
@@ -156,6 +161,56 @@ def start_tail(errlog):
 
     threading.Thread(target=pump, daemon=True).start()
     return proc, q
+
+
+def stop_tail(proc):
+    """Kill `wrangler tail` AND every process it spawned. Never raises.
+
+    The direct child is npx, which spawns node as a grandchild. Signalling only
+    the child leaves that grandchild running: it keeps tail.err open, keeps a
+    Cloudflare tail connection, and one leaks per run -- 129 had accumulated on
+    this machine, and the leaked handles are what turn a plain directory delete
+    into "Device or resource busy".
+
+    Windows first, and first for a reason: taskkill /T walks the parent-to-child
+    tree, so it only reaches the grandchild while the parent is still alive to
+    be walked from. Killing the parent first orphans the grandchild and the
+    tree becomes unreachable.
+
+    Never raises because this runs on the shutdown path, where masking the real
+    exit is worse than a surviving process.
+    """
+    if proc is None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, check=False)
+        except OSError:
+            pass
+    else:
+        # The child leads its own group (see start_tail), so the group is
+        # exactly its tree. SIGTERM first, SIGKILL if the tree does not go.
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(os.getpgid(proc.pid), sig)
+            except OSError:
+                break               # no such group: already gone
+            try:
+                proc.wait(timeout=5)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    try:                            # last resort, on the direct child only
+        proc.kill()
+        proc.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 
 
 def validate_config():
@@ -282,7 +337,7 @@ def run(seconds=0):
                 backoff = min(30, 2 ** (restarts - 1))
                 say("tail died (rc=%s); restart %d/%d in %ds"
                     % (proc.returncode, restarts, MAX_RESTARTS, backoff))
-                proc.terminate()
+                stop_tail(proc)
                 deadline_rem = None if deadline is None else \
                     deadline - time.time()
                 if deadline_rem is not None and deadline_rem <= 0:
@@ -309,10 +364,7 @@ def run(seconds=0):
             metrics.save_state(st)
         except (urllib.error.URLError, OSError) as exc:
             say("final push failed: %s" % exc)
-        try:
-            proc.terminate()
-        except (AttributeError, OSError):
-            pass
+        stop_tail(proc)
         evlog.close()
         errlog.close()
         exc = relay_lock.release_lock()
