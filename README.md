@@ -486,10 +486,10 @@ taskkill //F //T //PID <that number>
 | `tail.err` | `wrangler tail` stderr |
 | `relay.lock` | holder identity: pid, process start time, hostname, heartbeat |
 
-Tests: `python3 -m unittest relay_lock_test`. Standard library only — no
-dependencies, no config file, and no pytest, so it runs on the host and inside
-this container (where the repo is bind-mounted at `/state`) without anything
-being added to the image.
+Tests: `python -m unittest relay_lock_test` (`python3` in the container).
+Standard library only — no dependencies, no config file, and no pytest, so it
+runs on the host and inside this container (where the repo is bind-mounted at
+`/state`) without anything being added to the image.
 
 Env: `CF_WORKER`, `VM_URL`, `RELAY_WORKER_DIR`, `RELAY_INTERVAL`, `RELAY_STATE`,
 `RELAY_LOG`, `RELAY_LOCK`, `RELAY_MAX_RESTARTS`, `RELAY_HEALTH_MAX_AGE`, `GRAFANA_URL`,

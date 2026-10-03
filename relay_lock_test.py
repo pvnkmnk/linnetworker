@@ -1,4 +1,8 @@
-"""Tests for relay_lock. Run: python3 -m unittest relay_lock_test -v
+"""Tests for relay_lock. Run: python -m unittest relay_lock_test -v
+
+(`python3` inside the container. On Windows the `python3` on PATH is the
+Microsoft Store alias stub and exits 49 without running anything, so `python`
+is the form that works on the host.)
 
 Standard library only, deliberately. The image is python3-alpine with nothing
 installed but the relay, so a suite that needed pytest would not run where the
