@@ -140,9 +140,11 @@ def start_tail(errlog):
     stderr goes to a FILE, never PIPE: wrangler chatters on stderr and an unread
     pipe fills its buffer and deadlocks the child.
 
-    `start_new_session` puts the child in its OWN process group, so stop_tail can
-    signal the whole tree at once. Without it a signal reaches only npx and the
-    node process npx spawned survives.
+    `start_new_session` detaches the child into its own session deliberately:
+    the relay owns this child's lifetime explicitly, so it must not also inherit
+    the relay's session signals and get killed by a second, uncoordinated
+    route. That is why stop_tail signals the group by pgid rather than relying
+    on a broadcast reaching it.
     """
     proc = subprocess.Popen(
         ["npx", "wrangler", "tail", metrics.CF_WORKER, "--format", "json"],
@@ -163,7 +165,7 @@ def start_tail(errlog):
     return proc, q
 
 
-def stop_tail(proc):
+def stop_tail(proc, grace=3.0):
     """Kill `wrangler tail` AND every process it spawned. Never raises.
 
     The direct child is npx, which spawns node as a grandchild. Signalling only
@@ -177,11 +179,14 @@ def stop_tail(proc):
     be walked from. Killing the parent first orphans the grandchild and the
     tree becomes unreachable.
 
-    Never raises because this runs on the shutdown path, where masking the real
-    exit is worse than a surviving process.
+    Bounded on purpose. This runs on the shutdown path, where the budget is
+    Docker's 10s stop grace -- exceed it and the container is SIGKILLed, which
+    is a far worse outcome than a surviving child. `grace` caps the whole call:
+    the measured happy path is ~0.1s.
     """
     if proc is None:
         return
+    deadline = time.time() + grace
     if os.name == "nt":
         try:
             subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
@@ -198,19 +203,18 @@ def stop_tail(proc):
             except OSError:
                 break               # no such group: already gone
             try:
-                proc.wait(timeout=5)
+                proc.wait(timeout=max(0.0, deadline - time.time()))
                 break
             except subprocess.TimeoutExpired:
                 continue
     try:
-        proc.wait(timeout=10)
+        proc.wait(timeout=max(0.0, deadline - time.time()))
     except subprocess.TimeoutExpired:
-        pass
-    try:                            # last resort, on the direct child only
-        proc.kill()
-        proc.wait(timeout=5)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+        try:                        # last resort, on the direct child only
+            proc.kill()
+            proc.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
 def validate_config():
@@ -364,13 +368,18 @@ def run(seconds=0):
             metrics.save_state(st)
         except (urllib.error.URLError, OSError) as exc:
             say("final push failed: %s" % exc)
-        stop_tail(proc)
-        evlog.close()
-        errlog.close()
+        # Release BEFORE reaping the child. The lock guards the counters, and
+        # the counters are final from here on, so nothing after this point can
+        # still lose them. Reaping the tree can take seconds -- and if it were
+        # ever to outlast Docker's stop grace we would be SIGKILLed with the
+        # lock still on disk, and the next relay would refuse to start for 90s.
         exc = relay_lock.release_lock()
         if exc:
             print("relay: could not remove %s: %s" % (relay_lock.LOCK_PATH, exc),
                   file=sys.stderr, flush=True)
+        stop_tail(proc)
+        evlog.close()
+        errlog.close()
         say("done, %d events total" % st["events_total"])
     return exit_code
 
