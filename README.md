@@ -366,39 +366,46 @@ policy worth reviewing. `RELAY_LOG_*` stays there; these do not.
 
 The claim has to be indivisible, because the only thing worse than two relays is
 two relays that each believe there is one. `acquire_lock()` writes the whole
-record to a temp file and then makes it visible with `os.link`, which is an
-atomic create-if-absent: exactly one of N simultaneous racers gets the name, and
-the rest get `FileExistsError` without ever seeing a half-written file. Where a
-filesystem has no hard links it falls back to `O_CREAT|O_EXCL` — also atomic as a
-create, but empty for the instant before the write, which is why a lock file that
-exists but names nobody is treated as **held**, never as free.
+record to a temp file and then makes it visible with `os.link`, an atomic
+create-if-absent on POSIX and Windows: exactly one of N simultaneous racers gets
+the name, and the rest get `FileExistsError` without ever seeing a half-written
+file. A lock file that exists but carries no identity — empty, truncated, or not
+a record at all — is **held**, never free, and is refused at once rather than
+after a wait: with an atomic claim there is nothing that could still be filling
+it in.
 
 Measured before this change, on the host, with 20 processes released at the same
 instant against one lock path: **9 winners, 0 refusals, 11 crashes** — read,
-delete and truncating write were three separate steps, so processes raced into
-each other's `os.remove` and into each other's bytes. Measured after, three
-times, with `os.link` both live and forced to fail so the `O_EXCL` fallback ran:
+delete and truncating write were three separate steps. Measured after:
 
-| | winners | refusals | crashes | exit codes |
-| --- | --- | --- | --- | --- |
-| 20 processes, one lock path (Windows) | **1** | **19** | **0** | 1× `0`, 19× `1` |
-| the same, `os.link` forced to fail | **1** | **19** | **0** | 1× `0`, 19× `1` |
-| 20 processes inside the container, on the bind mount | **1** | **19** | **0** | — |
+| | winners | refusals | crashes |
+| --- | --- | --- | --- |
+| 20 processes, no lock present (Windows) | **1** | **19** | **0** |
+| 20 processes, **stale** lock present (Windows) | **1** | **19** | **0** |
+| 40 processes, stale lock present (Windows) | **1** | **39** | **0** |
+| 20 processes inside the container, on the bind mount | **1** | **19** | **0** |
 
-Every one of the 19 refusals named the winner's pid, and once all 20 had exited
-the refusal count sat at 19 and never dipped.
+Every refusal named the winner's pid. The stale-lock row is the one that earns
+its keep: it is the only fixture that reaches the reclaim path, and it is what
+caught the Windows bug below. A race from a cold lock never touches that code,
+which is exactly how that bug shipped with a clean-looking proof.
 
 There is a third refusal case alongside the two above: a lock file that is there
-but carries no identity — empty, truncated, or not a record at all. It is held,
-and the refusal says exactly that rather than inventing a holder:
+but names nobody. It is held, and the refusal says so rather than inventing a
+holder:
 
 ```
 $ python relay.py
 relay: relay.lock is held, but by nothing this process can name: the file holds
-no readable identity, so it is either a relay claiming it this instant or a
-corrupt lock. An unattributed lock is still held; stop it first, or delete
-/path/to/relay.lock
+no readable identity, so it is corrupt or truncated. An unattributed lock is
+still held; stop it first, or delete /path/to/relay.lock
 ```
+
+On Windows a file that any reader holds open cannot be unlinked, so reclaiming a
+stale lock raises `PermissionError` while `health.py` is mid-probe — which is
+the normal case, not a race. That means "not ours to remove, go round again",
+bounded by the same deadline as everything else; a relay that cannot reclaim
+within it refuses cleanly rather than dying with a traceback.
 
 The recovery paths are unchanged and re-proved: a dead pid on this host, a legacy
 bare-PID lock, and a lapsed cross-namespace heartbeat are all still reclaimed, and

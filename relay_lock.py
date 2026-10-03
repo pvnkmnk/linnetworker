@@ -110,12 +110,13 @@ HEARTBEAT_STALE = 90.0
 # mount would reclaim its lock and both relays would write state.json again.
 HEARTBEAT_EVERY = 15.0
 
-# How long acquire_lock keeps trying before it gives up on a lock it cannot make
-# sense of. The O_EXCL fallback leaves a window microseconds wide, so this is
-# only reached by a claim interrupted mid-write, or by a corrupt file -- neither
-# of which is normal, and both of which must end in a refusal rather than a
-# takeover.
+# How long acquire_lock keeps trying to reclaim a stale lock before giving up.
+# Reached when the file keeps changing hands, or -- the ordinary case -- when
+# Windows will not unlink it because a reader has it open. Either way the end is
+# a refusal, never a takeover of something still held.
 CLAIM_TIMEOUT = 5.0
+# Pause between reclaim attempts, so a remove that keeps failing does not spin
+# through claim temp files at fsync speed until the deadline.
 CLAIM_POLL = 0.02
 
 THIS_HOST = socket.gethostname()
