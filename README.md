@@ -470,6 +470,8 @@ taskkill //F //T //PID <that number>
 
 | file | role |
 | --- | --- |
+| `.github/workflows/ci.yml` | ruff and the three suites, on Linux and Windows |
+| `.github/branch-protection.json` | the settings record behind `main`'s required checks |
 | `Dockerfile` | python3 + node/wrangler + tini, so `npx` never fetches at start |
 | `docker-compose.yml` | the service: restart policy, mounts, env, healthcheck |
 | `relay.env` | persisted environment (git-ignored; may hold `GRAFANA_AUTH`) |
@@ -478,6 +480,8 @@ taskkill //F //T //PID <that number>
 | `event_log.py` | bounded append-only `events.log` and its rotation policy |
 | `relay_lock.py` | `relay.lock`: who won the claim, and whether that holder is still there |
 | `relay_lock_test.py` | tests for the above; stdlib `unittest`, nothing to install |
+| `event_log_test.py` | tests `event_log.py`: the caps, rotation, the orphan sweep |
+| `relay_test.py` | tests the ingest path end to end — drain, record, write |
 | `health.py` | JSON health probe; exit code is the verdict |
 | `provision_grafana.py` | datasource + dashboard, via the Grafana HTTP API |
 | `state.json` | counter totals — a restart does not reset them |
@@ -486,10 +490,42 @@ taskkill //F //T //PID <that number>
 | `tail.err` | `wrangler tail` stderr |
 | `relay.lock` | holder identity: pid, process start time, hostname, heartbeat |
 
-Tests: `python -m unittest relay_lock_test` (`python3` in the container).
-Standard library only — no dependencies, no config file, and no pytest, so it
-runs on the host and inside this container (where the repo is bind-mounted at
-`/state`) without anything being added to the image.
+Tests, one suite per module that holds state:
+
+```bash
+python -m unittest relay_lock_test    # 40
+python -m unittest event_log_test     # 27, of which 2 skip off Windows
+python -m unittest relay_test         # 31
+```
+
+Standard library only — no dependencies, no config file, and no pytest, so
+they run on the host and inside this container (where the repo is bind-mounted
+at `/state`) without anything being added to the image. `python3` in the
+container; `python` on the host, where the `python3` on PATH is the Microsoft
+Store alias stub and exits 49. `relay_test` is the slow one at ~7s against
+under a second for the other two, because it drives the real `run()` loop once
+per end-to-end test.
+
+Lint is the one tool that is not standard library — CI installs it per run,
+and a host needs it on PATH:
+
+```bash
+python -m pip install --upgrade ruff
+ruff check --select F .
+```
+
+[.github/workflows/ci.yml](.github/workflows/ci.yml) runs that lint and then
+the three suites on `ubuntu-latest` and `windows-latest`, `fail-fast: false`
+so one OS failing cannot hide the other's verdict, on every pull request and
+on every push to `main`. The two job names — `test (ubuntu-latest)` and
+`test (windows-latest)` — are `main`'s required status checks, so a red run
+blocks the merge.
+
+The applied settings live in
+[.github/branch-protection.json](.github/branch-protection.json): the verbatim
+`PUT` body for `main`'s protection, kept in the tree because a settings record
+is not something a reader would go looking for. It is a record, not a
+controller — editing it changes nothing until someone runs the `PUT` again.
 
 Env: `CF_WORKER`, `VM_URL`, `RELAY_WORKER_DIR`, `RELAY_INTERVAL`, `RELAY_STATE`,
 `RELAY_LOG`, `RELAY_LOCK`, `RELAY_MAX_RESTARTS`, `RELAY_HEALTH_MAX_AGE`, `GRAFANA_URL`,
