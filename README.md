@@ -197,9 +197,10 @@ gone after the first rotation).
 untouched. That check lives in `validate_config()` called from `run()` rather
 than at module scope, because `health.py` imports `relay` — an import-time exit
 took the health probe down with it, at exactly the moment the configuration is
-wrong and health reporting matters most. (It was worse than that: the guard used
-to sit beside the knobs and call `die()`, which is defined ~300 lines below, so
-it died with `NameError` instead of reporting anything.)
+wrong and health reporting matters most. (It was worse than that: the guard
+used to sit beside the knobs and call `die()`, which is defined near the
+bottom of the file, so it died with `NameError` instead of reporting
+anything.)
 
 **Rotation renames; it never truncates.** `os.replace` is `rename(2)`, so the
 retired file keeps its inode and an open reader — `tail -f`, a text search, a
@@ -356,8 +357,8 @@ rare in practice.
 crosses the boundary, so tying it to a successful `metrics.push()` would mean a
 VictoriaMetrics outage looks exactly like a dead relay — and the lock of a very
 alive relay gets reclaimed out from under it. Proven with the push pointed at a
-closed port: 8 consecutive failed pushes, and the heartbeat still advanced
-17.4s. `relay.py` beats every 15s from the run loop.
+closed port: the push failed every time while the heartbeat went on advancing
+on its own schedule. `relay.py` beats every 15s from the run loop.
 
 **Those two windows are constants in [relay_lock.py](relay_lock.py), not env
 knobs** — 15s to beat, 90s to consider the holder gone. They were knobs once and
@@ -502,12 +503,15 @@ Standard library only — no dependencies, no config file, and no pytest, so
 they run on the host and inside this container (where the repo is bind-mounted
 at `/state`) without anything being added to the image. `python3` in the
 container; `python` on the host, where the `python3` on PATH is the Microsoft
-Store alias stub and exits 49. `relay_test` is the slow one at roughly 7s,
-several times either of the other two, because it drives the real `run()` loop
-once per end-to-end test. The other two are not alike: `relay_lock_test`
-spawns twelve racers a round, which costs about 1.8s on Windows and 0.4s in
-the container, where `event_log_test` costs about half a second and a tenth of
-one.
+Store alias stub and exits 49.
+
+`relay_test` dominates the runtime by a wide margin, and the reason is
+structural rather than incidental: it drives the real `run()` loop once per
+end-to-end test, which the other two never do. `event_log_test` is the cheapest
+thing to run while editing; `relay_lock_test` pays for spawning real processes.
+Seconds are deliberately absent here. They measure the machine, not the suites,
+and a figure like that goes stale on the next change that makes a test heavier
+or lighter without anyone noticing it had.
 
 Lint is the one tool that is not standard library — CI installs it per run,
 and a host needs it on PATH:
@@ -565,12 +569,12 @@ and the writer of `relay.lock` cannot disagree.
 `sort_keys=True` hides it.** The pre-fix relay had a poll thread calling
 `save_state()` while the main loop inserted into the same dict. Measured on this
 machine's CPython 3.11, `indent=1` without `sort_keys` raised
-`RuntimeError: dictionary changed size during iteration` in **25/25** trials;
-adding `sort_keys=True` dropped it to **0/25**. So the shipped code was one
+`RuntimeError: dictionary changed size during iteration` in **every** trial;
+adding `sort_keys=True` dropped it to **none**. So the shipped code was one
 kwarg from a crash — and the old poller caught only `(URLError, OSError)`,
 neither of which `RuntimeError` is, so the exception would have killed the
 thread outright: counters frozen, dashboard still green. The single-owner
-design is 0/25 at *both* settings.
+design faults at *both* settings.
 
 Two things kept this invisible in production: the counter dict holds only a
 handful of real `outcome|status|method` combinations, so a *new* key — the only
@@ -584,13 +588,13 @@ inside `build_payload()` never faulted in any trial.
   on `/loki/api/v1/labels`). Raw events land in `events.log`.
 - **`wrangler tail` drops events under concurrency — upstream of the relay.**
   This is the biggest caveat on the numbers. Measured against a control where
-  raw `wrangler tail` ran with the relay out of the path entirely:
-  120 requests at parallelism 4, paced 250ms → **raw tail captured 62**,
-  relay captured **53** from the same run. Sequential traffic is exact
-  (20/20). So the relay adds no loss of its own — `events.log` line count,
-  `sum(requests)`, and `events_total` agree exactly on every run — but the
-  dashboard undercounts concurrent bursts, and always did. Worth knowing before
-  reading a rate() off it.
+  raw `wrangler tail` ran with the relay out of the path entirely: under
+  concurrent load both paths captured roughly half the requests, the raw tail
+  marginally ahead of the relay on the same run, while sequential traffic was
+  exact every time. So the relay adds no loss of its own — `events.log` line
+  count, `sum(requests)`, and `events_total` agree exactly on every run — but
+  the dashboard undercounts concurrent bursts, and always did. Worth knowing
+  before reading a rate() off it.
 - **Only traffic while the relay runs is captured.** `wrangler tail` is live.
   Cloudflare retains the logs for its own window, but this path only sees them
   while attached: the `workers/observability/telemetry/query` REST endpoint
