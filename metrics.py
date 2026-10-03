@@ -96,7 +96,7 @@ def record(st, ev):
     st["cpu_sum_ms"] += float(ev.get("cpuTime") or 0)
     st["wall_sum_ms"] += float(ev.get("wallTime") or 0)
     st["events_total"] += 1
-    st["last_event_ms"] = max(st["last_event_ms"], int(ev.get("eventTimestamp") or 0))
+    st["last_event_ms"] = int(ev.get("eventTimestamp") or 0)
     return True
 
 
