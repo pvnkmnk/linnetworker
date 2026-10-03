@@ -411,14 +411,22 @@ def _drop_stale(entry):
     where it sees the live holder and refuses. It narrows the window to the
     microseconds between this read and the remove; it does not close it, because
     there is no compare-and-delete on either platform. See the module docstring.
+
+    Failing to remove is never fatal, only "not ours to remove, go round again".
+    FileNotFoundError is another reclaimer having won. PermissionError is Windows
+    declining to unlink a file somebody has open -- and health.py opens
+    relay.lock on every probe, so a relay starting against a stale lock races
+    the probe by default. That is the common case here, not a rare one: it was
+    unhandled, and it killed relay.py at startup with a traceback instead of
+    reclaiming the lock it had already decided was dead.
     """
     current, present = _lock_view()
     if not present or current is None or current != entry:
         return False
     try:
         os.remove(LOCK_PATH)
-    except FileNotFoundError:
-        return False                # another reclaimer got there first
+    except OSError:
+        return False                # gone, or held open: try again
     return True
 
 
@@ -446,7 +454,16 @@ def acquire_lock():
             return
         entry, present = _lock_view()
         if not present:
-            continue                 # gone under us, and nobody holds it: take it
+            # Gone under us between our claim and this read, and nobody holds it,
+            # so take it. Bounded like every other branch: this one used to spin
+            # with no deadline in sight, writing and fsyncing a claim temp file on
+            # every pass. The message is approximate -- the file is not there --
+            # but an unattributed refusal is the right shape for "the lock would
+            # not settle", and it is bounded, which is what matters at startup.
+            if time.monotonic() < deadline:
+                time.sleep(CLAIM_POLL)
+                continue
+            raise LockHeld(None, LOCK_PATH)
         if entry is None:
             # Present, unreadable: a claim caught mid-write, or a corrupt file.
             # Wait a moment for an identity so the refusal can name the holder,
@@ -460,7 +477,11 @@ def acquire_lock():
             raise LockHeld(entry["pid"], LOCK_PATH,
                            holder_host=entry.get("host") or THIS_HOST,
                            verifiable=verifiable)
-        _drop_stale(entry)
+        if not _drop_stale(entry):
+            # Not ours to remove -- another reclaimer won, or Windows is holding
+            # the file open. Pause before trying again, or the retry spins
+            # through claim temp files at fsync speed until the deadline.
+            time.sleep(CLAIM_POLL)
         if time.monotonic() >= deadline:
             # Only reachable if processes keep dying and reclaiming the same
             # dead lock in a loop. Refuse rather than spin: an unbounded wait
