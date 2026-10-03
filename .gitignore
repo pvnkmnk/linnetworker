@@ -1,0 +1,14 @@
+# Runtime state, not source.
+state.json
+# events.log AND its rotated generations (events.log.1, .2, .3). The
+# generations are separate paths, so a bare `events.log` line does not cover
+# them -- caught by `git status --untracked-files=all` showing .1/.2 listed.
+events.log
+events.log.*
+tail.err
+relay.lock
+__pycache__/
+
+# Holds GRAFANA_AUTH -- a live Grafana admin password. Never commit it.
+relay.env
+relay.env.*

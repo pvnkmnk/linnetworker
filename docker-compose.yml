@@ -1,0 +1,126 @@
+# The relay as a service.
+#
+# WHY a compose service and not nssm/WinSW or Task Scheduler: every other
+# long-running process on this machine is already a container under
+# `restart: unless-stopped` (ops-web, ops-worker, portal-grafana,
+# portal-victoriametrics, komodo-core). One mechanism means one mental model,
+# one way to inspect and stop everything, and boot start without a separate
+# installer. Compose also supplies what the mission asked for directly:
+# `restart: unless-stopped` (respawn on exit, backoff supplied by Docker),
+# SIGTERM on `docker stop` (which the relay's `finally` already handles), a
+# stable container name, and a HEALTHCHECK a monitor can poll.
+#
+# NOT the `netrunner` compose project, and no longer inside that repository at
+# all: this relay has its own repo because it watches a Cloudflare Worker, not
+# the NetRunner deployment, and it must keep tailing while the app stack is
+# down -- neither stack should be able to take the other with it. Project name
+# is pinned so the container name is predictable for `docker kill` proofs and
+# for the health poll.
+name: cf-worker-relay
+
+services:
+  relay:
+    build:
+      # Build, not bind mount: the Worker's checkout has no node_modules, so a
+      # mounted tree would make `npx wrangler` fetch wrangler from npm on every
+      # start. The image installs wrangler once. The Python sources are small
+      # and always current in the image; `docker compose build` is the upgrade.
+      context: .
+      dockerfile: Dockerfile
+    image: cf-worker-relay:latest
+    container_name: cf-worker-relay
+    restart: unless-stopped
+
+    # Persisted environment. Nothing is re-exported by hand any more: the RELAY_*
+    # knobs, the worker name and the VictoriaMetrics URL all live in relay.env.
+    # Keep that file out of git -- it may hold GRAFANA_AUTH.
+    env_file:
+      - path: ./relay.env
+        required: true
+
+    # events.log is bounded on BOTH axes, because a relay that now runs forever
+    # under `restart: unless-stopped` would otherwise grow it without limit and
+    # take the host bind mount's disk with it. Live file plus the retained
+    # generations is the worst case: 16 MiB * (1 + 3) = 64 MiB.
+    #
+    # These live here rather than only in relay.env because they are policy, not
+    # secret, and a bound nobody can see in a git-ignored file is a bound nobody
+    # reviews. Rotation renames (rename(2) on Linux) rather than truncates, so a
+    # reader tailing the retired file keeps its handle and reads to EOF instead
+    # of watching the bytes under it change.
+    environment:
+      RELAY_WORKER_DIR: "/worker"         # where wrangler tail reads wrangler.toml
+      RELAY_LOG_MAX_BYTES: "16777216"     # 16 MiB per file
+      RELAY_LOG_MAX_FILES: "3"           # retired generations kept
+      RELAY_LOG_ROTATE_ATTEMPTS: "3"     # a reader may be closing
+      RELAY_LOG_ROTATE_WARN_EVERY: "60"  # rate-limit "cap not in effect"
+      # A blocked rename is retried on this interval, NOT per event, so a
+      # reader parked on the log cannot turn housekeeping into per-event
+      # syscalls. Closing the reader still self-heals within this window.
+      RELAY_LOG_ROTATE_RETRY_EVERY: "30"
+      RELAY_LOG_SWEEP_MAX: "64"          # how far up to look for orphans
+      # The lock's heartbeat windows (constants in relay_lock.py) are deliberately
+      # NOT here. They are not policy to review: the cross-namespace liveness rule
+      # only works with a wide margin between them, so a value that breaks the
+      # mechanism is not one to expose beside the log bounds.
+
+    volumes:
+      # The observed Worker's directory. `wrangler tail` runs with cwd here and
+      # reads its wrangler.toml -- and that Worker lives in ANOTHER repository,
+      # so this path is a knob, not a sibling of this file. RELAY_WORKER_DIR
+      # defaults to this checkout of it; override it in relay.env if the Worker
+      # moves. Read-only is deliberate: the relay must not be able to edit the
+      # config it is tailing, and wrangler tail needs no writes (its own logs go
+      # to the config dir mounted below).
+      - ${RELAY_WORKER_DIR:-../djinn-netrunner/ops/linear-webhook}:/worker:ro
+
+      # Relay state on the host, not in a Docker volume: state.json is the
+      # counter memory and events.log is the raw capture. Keeping them in the
+      # working tree makes both visible (`tail -f events.log`) and keeps the
+      # unbounded-log follow-up actionable instead of invisible inside a volume.
+      - ./:/state
+
+      # Wrangler's OAuth token. Bind-mounted READ-WRITE on purpose: wrangler
+      # refreshes the token in place and writes logs under .wrangler/logs, so a
+      # read-only mount breaks it after expiry. It is never baked into an image.
+      - ${USERPROFILE}/AppData/Roaming/xdg.config/.wrangler:/root/.config/.wrangler
+
+    # Machine-readable health. A dead relay reports UNHEALTHY; it does not sit
+    # there looking like a Worker with no traffic.
+    healthcheck:
+      test: ["CMD", "python3", "/app/health.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # One-shot Grafana provisioning, run on demand -- NOT part of the always-on
+  # service, because it needs GRAFANA_AUTH and must not hold a credential in a
+  # long-lived container. It lives here so the credential has a persisted home:
+  #
+  #   echo "GRAFANA_AUTH=admin:$(docker exec portal-grafana printenv GF_SECURITY_ADMIN_PASSWORD)" >> relay.env
+  #   docker compose --profile provision run --rm provisioner
+  provisioner:
+    profiles: ["provision"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cf-worker-relay:latest
+    container_name: cf-worker-relay-provisioner
+    restart: "no"
+    entrypoint: ["python3", "-u", "/app/provision_grafana.py"]
+    env_file:
+      - path: ./relay.env
+        required: true
+    environment:
+      # Inside the container the Grafana service name resolves on the compose
+      # network... except it is in the `portal` project, so this is the host.
+      GRAFANA_URL: ${GRAFANA_URL:-http://host.docker.internal:3082}
+    volumes:
+      - ${USERPROFILE}/AppData/Roaming/xdg.config/.wrangler:/root/.config/.wrangler
