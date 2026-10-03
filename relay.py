@@ -329,9 +329,9 @@ def run(seconds=0):
                     deadline - time.time()
                 if deadline_rem is not None and deadline_rem <= 0:
                     break
-                # Sleep in slices so --seconds still bounds a restart backoff. The backoff is
-                # capped at 30s against relay_lock's 90s heartbeat window, so the
-                # lock cannot lapse while sleeping here.
+                # Sleep in slices so --seconds still bounds a restart backoff.
+                # The backoff is capped at 30s against relay_lock's 90s heartbeat
+                # window, so the lock cannot lapse while sleeping here.
                 waited = 0.0
                 while waited < backoff:
                     time.sleep(min(WAKE, backoff - waited))
@@ -365,7 +365,8 @@ def run(seconds=0):
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Relay Cloudflare Workers Logs to VictoriaMetrics")
+    ap = argparse.ArgumentParser(
+        description="Relay Cloudflare Workers Logs to VictoriaMetrics")
     ap.add_argument("--seconds", type=float, default=0,
                     help="run for N seconds then exit (0 = forever)")
     sys.exit(run(**vars(ap.parse_args())))

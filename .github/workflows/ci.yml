@@ -46,8 +46,13 @@ jobs:
       - name: Install ruff
         run: python -m pip install --upgrade ruff
 
+      # F alone was too narrow to see line length: three over-long lines sat
+      # in relay.py and health.py while this gate called the repo clean. E
+      # adds that class. It does not add formatting rules -- ruff ships the
+      # blank-line, whitespace and indentation checks as preview only -- so
+      # this gate covers line length, statement rules and syntax, not layout.
       - name: Lint
-        run: ruff check --select F .
+        run: ruff check --select E,F .
 
       - name: Test relay_lock
         run: python -m unittest relay_lock_test

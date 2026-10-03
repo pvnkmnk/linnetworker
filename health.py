@@ -113,7 +113,8 @@ def main():
         else:
             report["reason"] = ("relay not running: %s is held by pid %s, which is "
                                 "gone or was replaced"
-                                % (os.path.basename(relay_lock.LOCK_PATH), entry["pid"]))
+                                % (os.path.basename(relay_lock.LOCK_PATH),
+                                   entry["pid"]))
 
     # 2. state freshness = still shipping
     state, err = read_state()
