@@ -133,13 +133,21 @@ class LockHeld(Exception):
     `pid` of None is the third situation: the lock is there and names nobody,
     because the file is corrupt or truncated. It is held, and the message says
     so rather than inventing a holder.
+
+    `unclaimable` is the fourth, and the only one where nothing holds anything:
+    the claim could not be made at all, so the operator needs a filesystem fact,
+    not a lock to go and stop.
     """
 
-    def __init__(self, pid, path, holder_host=None, verifiable=True, detail=None):
+    def __init__(self, pid, path, holder_host=None, verifiable=True, detail=None,
+                 unclaimable=False):
         self.pid = pid
         self.path = path
         self.holder_host = holder_host
         self.verifiable = verifiable
+        # True only when the claim itself failed, so nothing holds the lock.
+        # Distinct from pid=None, which means a lock nobody can name.
+        self.unclaimable = unclaimable
         if detail:
             msg = detail
         elif pid is None:
@@ -329,10 +337,10 @@ def _claim(identity):
     text-mode write on Windows would rewrite newlines, and _drop_stale compares
     this record byte for byte.
 
-    A link failure that is not "it is already there" is deliberately not
-    swallowed -- it means the state directory is on a filesystem without hard
-    links, which is worth failing loudly at startup rather than quietly running
-    without a lock.
+    Returns False only for "somebody already has it". Any other failure to make
+    the claim raises, and acquire_lock turns it into a refusal that says which
+    file and what to check -- see there. Silently returning False would make an
+    unwritable state directory look exactly like a held lock.
     """
     tmp = "%s.claim.%d" % (LOCK_PATH, os.getpid())
     try:
@@ -352,6 +360,23 @@ def _claim(identity):
             pass
 
 
+def _remove_lock():
+    """Remove LOCK_PATH. True if it went; False if it was already gone.
+
+    Sharing violations deliberately propagate. On Windows a file any reader has
+    open cannot be unlinked, and health.py opens relay.lock on every probe, so
+    PermissionError here is the ordinary case for a stale reclaim -- not an error
+    to swallow inside a staleness check, but the caller's "not ours to remove,
+    try again" decision to make. That was unhandled once, and it killed relay.py
+    at startup with a traceback.
+    """
+    try:
+        os.remove(LOCK_PATH)
+    except FileNotFoundError:
+        return False                # another reclaimer got there first
+    return True
+
+
 def _drop_stale(entry):
     """Remove a lock whose holder is conclusively dead. True if it went.
 
@@ -361,23 +386,32 @@ def _drop_stale(entry):
     the new holder's claim. Re-reading and comparing against the record we
     judged dead catches that case and sends the loser round the loop again, where
     it sees the live holder and refuses. What that leaves open is in the module
-    docstring.
-
-    Failing to remove is never fatal, only "not ours to remove, go round again".
-    FileNotFoundError is another reclaimer having won. PermissionError is Windows
-    declining to unlink a file somebody has open -- and health.py opens
-    relay.lock on every probe, so a relay starting against a stale lock races
-    the probe by default. That was unhandled, and it killed relay.py at startup
-    with a traceback instead of reclaiming a lock it had already called dead.
+    docstring. A remove that fails for any other reason raises, and the caller
+    decides; see _remove_lock.
     """
     current, present = _lock_view()
     if not present or current is None or current != entry:
         return False
-    try:
-        os.remove(LOCK_PATH)
-    except OSError:
-        return False                # gone, or held open: try again
-    return True
+    return _remove_lock()
+
+
+def _claim_failed(exc):
+    """The refusal text for a claim that could not be made at all.
+
+    Every other refusal in this module can name a holder, because there is one.
+    This one cannot: nothing holds the lock, and nothing may. What it can do is
+    name the file, say plainly that the claim failed, and list the three things
+    worth checking -- all of which are filesystem facts the operator can act on,
+    rather than an errno with no path attached.
+    """
+    return ("could not claim %s: the lock could not be created (%s: %s).\n"
+            "  Nothing holds it -- the claim itself failed. Check that:\n"
+            "    * the filesystem holding the state directory supports hard "
+            "links (exFAT and some network shares do not);\n"
+            "    * the state directory is writable by this user;\n"
+            "    * the permissions on %s and the directory above it allow "
+            "creating and linking files."
+            % (LOCK_PATH, type(exc).__name__, exc, LOCK_PATH))
 
 
 def acquire_lock():
@@ -400,7 +434,17 @@ def acquire_lock():
     """
     deadline = time.monotonic() + CLAIM_TIMEOUT
     while True:
-        if _claim(_identity()):
+        try:
+            claimed = _claim(_identity())
+        except OSError as exc:
+            # The claim could not be made at all: a filesystem without hard-link
+            # support, a state directory that is not writable, or permissions.
+            # None of those is a reason to keep looping, and none of them is a
+            # reason to run without a lock, so it is a refusal that names the
+            # file and what to check -- the same exit-1 path as every other.
+            raise LockHeld(None, LOCK_PATH, detail=_claim_failed(exc),
+                           unclaimable=True)
+        if claimed:
             return
         entry, present = _lock_view()
         if not present:
@@ -424,10 +468,17 @@ def acquire_lock():
             raise LockHeld(entry["pid"], LOCK_PATH,
                            holder_host=entry.get("host") or THIS_HOST,
                            verifiable=verifiable)
-        if not _drop_stale(entry):
-            # Not ours to remove -- another reclaimer won, or Windows is holding
-            # the file open. Pause before trying again, or the retry spins
-            # through claim temp files at fsync speed until the deadline.
+        try:
+            removed = _drop_stale(entry)
+        except OSError:
+            # Windows will not unlink a file somebody has open, and health.py
+            # holds relay.lock open on every probe, so this is ordinary rather
+            # than exotic. Not ours to remove: go round again.
+            removed = False
+        if not removed:
+            # Another reclaimer won, or the OS said no. Pause before trying
+            # again, or the retry spins through claim temp files at fsync speed
+            # until the deadline.
             time.sleep(CLAIM_POLL)
         if time.monotonic() >= deadline:
             # Only reachable if processes keep dying and reclaiming the same

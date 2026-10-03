@@ -221,6 +221,12 @@ def run(seconds=0):
         # The refusal has to distinguish "definitely another relay" from "a
         # holder I cannot check", because the operator's next action differs:
         # stop that relay, versus confirm it is gone and delete the lock.
+        if exc.unclaimable:
+            # The claim itself failed, so nothing holds the lock and there is
+            # nothing to delete. The message already says which file and what to
+            # check; appending "stop it first" to it would be advice for a
+            # problem that does not exist.
+            die(str(exc))
         if exc.verifiable or exc.pid is None:
             # An unattributed lock (pid None) belongs in this branch too: "stop it
             # first, or delete it by hand" is the right advice for a wedged or

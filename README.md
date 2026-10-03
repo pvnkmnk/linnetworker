@@ -407,6 +407,27 @@ the normal case, not a race. That means "not ours to remove, go round again",
 bounded by the same deadline as everything else; a relay that cannot reclaim
 within it refuses cleanly rather than dying with a traceback.
 
+**A claim that cannot be made at all is a refusal too.** If the lock cannot be
+created — a filesystem without hard-link support, a state directory that is not
+writable, or permissions — nothing holds the lock and nothing should retry, so
+`acquire_lock` refuses on the same exit-1 path and says which file failed and
+what to check:
+
+```
+$ python relay.py
+relay: could not claim /srv/netrunner/relay.lock: the lock could not be created
+(PermissionError: [Errno 1] Operation not permitted).
+  Nothing holds it -- the claim itself failed. Check that:
+    * the filesystem holding the state directory supports hard links (exFAT and
+some network shares do not);
+    * the state directory is writable by this user;
+    * the permissions on /srv/netrunner/relay.lock and the directory above it
+allow creating and linking files.
+```
+
+Unlike every other refusal, this one must not be answered by deleting the lock:
+there is no holder, and the file is not the problem.
+
 The recovery paths are unchanged and re-proved: a dead pid on this host, a legacy
 bare-PID lock, and a lapsed cross-namespace heartbeat are all still reclaimed, and
 a fresh unverifiable lock is still refused.
