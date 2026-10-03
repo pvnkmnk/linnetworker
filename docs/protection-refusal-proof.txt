@@ -1,0 +1,138 @@
+==============================================================
+BRANCH PROTECTION PROBE
+==============================================================
+repo         pvnkmnk/linnetworker
+stand-in     protection-probe   (disposable; main is never a target)
+rule source  .github/branch-protection.json
+main sha     c46fe5637dab27b6069308a46963e0d7290d0e2f
+main prot    899a22863d3c9e63  (sha256 prefix of the live protection)
+
+Refspecs this script will push -- and nothing else:
+  create stand-in   c46fe5637dab27b6069308a46963e0d7290d0e2f:refs/heads/protection-probe
+  control push      refs/heads/local/protection-probe:refs/heads/protection-probe
+  force-push probe  +refs/heads/local/protection-probe:refs/heads/protection-probe --force
+  delete probe      refs/heads/protection-probe  (git push origin --delete)
+
+No refspec naming main appears in this script.
+
+--------------------------------------------------------------
+1. CREATE THE STAND-IN (unprotected)
+--------------------------------------------------------------
+$ git push origin c46fe5637dab27b6069308a46963e0d7290d0e2f:refs/heads/protection-probe
+    remote: 
+    remote: Create a pull request for 'protection-probe' on GitHub by visiting:        
+    remote:      https://github.com/pvnkmnk/linnetworker/pull/new/protection-probe        
+    remote: 
+    To https://github.com/pvnkmnk/linnetworker.git
+     * [new branch]      c46fe5637dab27b6069308a46963e0d7290d0e2f -> protection-probe
+[exit 0]
+
+--------------------------------------------------------------
+2. CONTROL 1 -- a normal push must SUCCEED (branch still unprotected)
+--------------------------------------------------------------
+Proves the push path, the credential and the refspec are sound BEFORE
+any refusal is attributed to a protection hook.
+
+$ git push origin refs/heads/local/protection-probe:refs/heads/protection-probe
+    To https://github.com/pvnkmnk/linnetworker.git
+       c46fe56..f53349c  local/protection-probe -> protection-probe
+[exit 0]
+
+--------------------------------------------------------------
+3. APPLY THE RECORDED RULE SET TO THE STAND-IN
+--------------------------------------------------------------
+$ gh api -X PUT repos/pvnkmnk/linnetworker/branches/protection-probe/protection --input .github/branch-protection.json
+[exit 0]
+
+Rule set now live on protection-probe:
+    allow_force_pushes             False
+    allow_deletions                False
+    enforce_admins                 False
+    required_linear_history        False
+    lock_branch                    False
+    block_creations                False
+    required_status_checks         strict=False contexts=['test (ubuntu-latest)', 'test (windows-latest)']
+
+--------------------------------------------------------------
+4. PROBE A -- REAL force-push at the stand-in (expect: REFUSED)
+--------------------------------------------------------------
+A real history rewrite, no --dry-run: the commit is amended so the push
+is genuinely non-fast-forward.
+
+local tip is now 2b9e1c34689ef59deef0a20d86ec1e73bacbeec1, which is NOT a descendant of the remote tip:
+    2b9e1c3 control: a plain fast-forward push (rewritten)
+
+$ git push --force origin +refs/heads/local/protection-probe:refs/heads/protection-probe
+    remote: error: GH006: Protected branch update failed for refs/heads/protection-probe.        
+    remote: 
+    remote: - Cannot force-push to this branch        
+    To https://github.com/pvnkmnk/linnetworker.git
+     ! [remote rejected] local/protection-probe -> protection-probe (protected branch hook declined)
+    error: failed to push some refs to 'https://github.com/pvnkmnk/linnetworker.git'
+[exit 1]
+
+--------------------------------------------------------------
+5. PROBE B -- REAL deletion of the stand-in (expect: REFUSED)
+--------------------------------------------------------------
+$ git push origin --delete protection-probe
+    remote: error: GH006: Protected branch update failed for refs/heads/protection-probe.        
+    remote: 
+    remote: - Cannot delete this branch        
+    To https://github.com/pvnkmnk/linnetworker.git
+     ! [remote rejected] protection-probe (protected branch hook declined)
+    error: failed to push some refs to 'https://github.com/pvnkmnk/linnetworker.git'
+[exit 1]
+
+--------------------------------------------------------------
+6. CONTROL 2 -- delete an UNPROTECTED branch (expect: SUCCEEDS)
+--------------------------------------------------------------
+The stand-in is still protected, so a refusal in step 5 is attributable
+to that. This shows the delete path itself is functional.
+
+$ git push origin c46fe5637dab27b6069308a46963e0d7290d0e2f:refs/heads/protection-probe-delete-control
+    remote: 
+    remote: Create a pull request for 'protection-probe-delete-control' on GitHub by visiting:        
+    remote:      https://github.com/pvnkmnk/linnetworker/pull/new/protection-probe-delete-control        
+    remote: 
+    To https://github.com/pvnkmnk/linnetworker.git
+     * [new branch]      c46fe5637dab27b6069308a46963e0d7290d0e2f -> protection-probe-delete-control
+[exit 0]
+
+$ git push origin --delete protection-probe-delete-control
+    To https://github.com/pvnkmnk/linnetworker.git
+     - [deleted]         protection-probe-delete-control
+[exit 0]
+
+==============================================================
+VERDICT (cleanup runs after this)
+==============================================================
+control 1  plain push to unprotected stand-in      -> SUCCEEDED (expected)
+probe A    --force push to PROTECTED stand-in    -> REFUSED (expected)
+probe B    delete of PROTECTED stand-in           -> REFUSED (expected)
+control 2  delete of UNPROTECTED sibling          -> SUCCEEDED (expected)
+
+Both refusals landed and both controls behaved. The recorded rule set
+refuses a force-push and a deletion.
+
+==============================================================
+CLEANUP
+==============================================================
+$ gh api -X DELETE repos/pvnkmnk/linnetworker/branches/protection-probe/protection
+[protection removed: exit 0]
+$ git push origin --delete protection-probe
+    To https://github.com/pvnkmnk/linnetworker.git
+     - [deleted]         protection-probe
+[delete exit 0]
+    Deleted branch local/protection-probe (was 2b9e1c3).
+
+--- state of the remote after cleanup ---
+$ git ls-remote --heads origin
+    ab81c24e234828a963d31b8e581ade45fa3708ac	refs/heads/ci-workflow
+    4f9095e459554f47fec9549dcc2df81184e7ff7a	refs/heads/event-log-tests
+    c46fe5637dab27b6069308a46963e0d7290d0e2f	refs/heads/main
+    213529987ae6d5ab2f785fed2afb1a031fbae13d	refs/heads/relay-ingest-tests
+
+--- main, before vs after ---
+  sha        c46fe5637dab27b6069308a46963e0d7290d0e2f -> c46fe5637dab27b6069308a46963e0d7290d0e2f
+  protection 899a22863d3c9e63 -> 899a22863d3c9e63
+  RESULT: main UNCHANGED (same sha, same protection).
