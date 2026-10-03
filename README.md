@@ -477,6 +477,7 @@ taskkill //F //T //PID <that number>
 | `metrics.py` | the counters, the payload they become, the VM push |
 | `event_log.py` | bounded append-only `events.log` and its rotation policy |
 | `relay_lock.py` | `relay.lock`: who won the claim, and whether that holder is still there |
+| `relay_lock_test.py` | tests for the above; stdlib `unittest`, nothing to install |
 | `health.py` | JSON health probe; exit code is the verdict |
 | `provision_grafana.py` | datasource + dashboard, via the Grafana HTTP API |
 | `state.json` | counter totals — a restart does not reset them |
@@ -484,6 +485,11 @@ taskkill //F //T //PID <that number>
 | `events.log.1`, `.2`, `.3` | retired generations, oldest last, bounded count |
 | `tail.err` | `wrangler tail` stderr |
 | `relay.lock` | holder identity: pid, process start time, hostname, heartbeat |
+
+Tests: `python3 -m unittest relay_lock_test`. Standard library only — no
+dependencies, no config file, and no pytest, so it runs on the host and inside
+this container (where the repo is bind-mounted at `/state`) without anything
+being added to the image.
 
 Env: `CF_WORKER`, `VM_URL`, `RELAY_WORKER_DIR`, `RELAY_INTERVAL`, `RELAY_STATE`,
 `RELAY_LOG`, `RELAY_LOCK`, `RELAY_MAX_RESTARTS`, `RELAY_HEALTH_MAX_AGE`, `GRAFANA_URL`,
