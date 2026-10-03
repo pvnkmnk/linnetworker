@@ -502,9 +502,12 @@ Standard library only — no dependencies, no config file, and no pytest, so
 they run on the host and inside this container (where the repo is bind-mounted
 at `/state`) without anything being added to the image. `python3` in the
 container; `python` on the host, where the `python3` on PATH is the Microsoft
-Store alias stub and exits 49. `relay_test` is the slow one at ~7s against
-under a second for the other two, because it drives the real `run()` loop once
-per end-to-end test.
+Store alias stub and exits 49. `relay_test` is the slow one at roughly 7s,
+several times either of the other two, because it drives the real `run()` loop
+once per end-to-end test. The other two are not alike: `relay_lock_test`
+spawns twelve racers a round, which costs about 1.8s on Windows and 0.4s in
+the container, where `event_log_test` costs about half a second and a tenth of
+one.
 
 Lint is the one tool that is not standard library — CI installs it per run,
 and a host needs it on PATH:
