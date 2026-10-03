@@ -57,27 +57,20 @@ One indivisible step, or none at all
 ------------------------------------
 Creating the lock and filling it in cannot be two acts another process can slip
 between, or two relays both believe they hold the run. The claim writes the
-whole record to a temp file and then makes it visible with os.link, which is an
-atomic create-if-absent: exactly one of N simultaneous racers gets the name, the
-losers get FileExistsError, and nobody ever observes a half-written record.
-Measured working on the host (NTFS) and on the container's bind mount.
-
-Measured before this change, on the host, with 20 processes released at the same
-instant against one lock path: 9 winners, 0 refusals, 11 crashes. Read, delete
-and truncating write were three separate steps, so processes raced into each
-other's os.remove (FileNotFoundError, uncaught) and into each other's bytes.
-
-Two things follow from a file that can exist without naming anyone:
-
-  * a newcomer must NOT read that as "no lock" and take it. A blank lock is a
-    claim in flight, and stealing it is exactly the corruption this file exists
-    to prevent;
-  * a reader must not crash on it. A partial read is a state to be handled, not
-    an exception.
+whole record to a temp file and then makes it visible with os.link, an atomic
+create-if-absent on both POSIX and Windows: exactly one of N simultaneous racers
+gets the name, the losers get FileExistsError, and a reader sees either no file
+or a complete record -- never half of one. Measured on the host (NTFS) and on
+the container's bind mount.
 
 So the PRESENCE of the file is the lock, and its contents are only the
-attribution. A lock that exists without an identity is held by nobody we can
-name: refused, with a refusal that says exactly that rather than guessing.
+attribution. A lock that names nobody readable is held by nobody we can name:
+refused, with a refusal that says exactly that rather than guessing.
+
+Measured before this, on the host, with 20 processes released at the same instant
+against one lock path: 9 winners, 0 refusals, 11 crashes, because read, delete
+and truncating write were three separate steps. After: 1 winner and 19 refusals
+naming it, in every race since, from a cold lock and from a stale one.
 
 What is still not perfect, stated plainly
 -----------------------------------------
@@ -137,8 +130,8 @@ class LockHeld(Exception):
     which one they are looking at.
 
     `pid` of None is the third situation: the lock is there and names nobody,
-    which is a claim in flight or a file we cannot parse. It is held, and the
-    message says so rather than inventing a holder.
+    because the file is corrupt or truncated. It is held, and the message says
+    so rather than inventing a holder.
     """
 
     def __init__(self, pid, path, holder_host=None, verifiable=True, detail=None):
@@ -150,9 +143,8 @@ class LockHeld(Exception):
             msg = detail
         elif pid is None:
             msg = ("%s is held, but by nothing this process can name: the file "
-                   "holds no readable identity, so it is either a relay "
-                   "claiming it this instant or a corrupt lock. An "
-                   "unattributed lock is still held"
+                   "holds no readable identity, so it is corrupt or truncated. "
+                   "An unattributed lock is still held"
                    % os.path.basename(path))
         elif not verifiable:
             msg = ("the lock is held by a relay on %s (pid %s there), which this "
@@ -327,63 +319,24 @@ def _identity():
             "heartbeat_ms": int(time.time() * 1000)}
 
 
-def _encode(entry):
-    """The lock's exact bytes. Binary, so nothing rewrites them on the way out:
-    a text-mode write on Windows would translate newlines, and this record is
-    compared byte-for-byte by the re-read in _drop_stale.
-    """
-    return json.dumps(entry, sort_keys=True).encode("utf-8")
-
-
-def _claim_exclusive(identity):
-    """O_CREAT|O_EXCL: an atomic create, but the file is empty until the write.
-
-    The portable fallback, for a filesystem with no hard links. Returns True
-    only if this process created the lock. If the write fails the file is
-    removed again -- we created it exclusively, so it is unambiguously ours, and
-    leaving a blank lock behind would wedge every later starter.
-    """
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
-    try:
-        fd = os.open(LOCK_PATH, flags, 0o644)
-    except FileExistsError:
-        return False
-    try:
-        os.write(fd, _encode(identity))
-    except OSError:
-        os.close(fd)
-        try:
-            os.remove(LOCK_PATH)
-        except OSError:
-            pass
-        raise
-    os.close(fd)
-    return True
-
-
 def _claim(identity):
     """Make LOCK_PATH exist holding `identity`, or return False if it is taken.
 
-    Two mechanisms, because they fail differently.
+    The lock IS the finished temp file under a second name, so it comes into
+    existence already holding its record. fsync first, so a crash cannot leave
+    the visible name pointing at unwritten blocks. The bytes go out binary: a
+    text-mode write on Windows would rewrite newlines, and _drop_stale compares
+    this record byte for byte.
 
-    os.link  The lock IS the finished temp file under a second name, so it comes
-             into existence already holding its record: one indivisible step,
-             and a reader sees either no file or a complete one. link(2) and
-             CreateHardLinkW are both atomic create-if-absent, so exactly one
-             racer gets the name. fsync before the link, so a crash cannot leave
-             the visible name pointing at unwritten blocks.
-
-    O_EXCL   The fallback, taken on any non-FileExistsError from link --
-             including "this filesystem has no hard links". Equally atomic as a
-             CREATE, but empty for the instant before the write, which is why
-             _lock_view() counts a blank file as held rather than absent. If the
-             directory is genuinely unwritable the fallback raises that error
-             rather than hiding it behind a swallowed link error.
+    A link failure that is not "it is already there" is deliberately not
+    swallowed -- it means the state directory is on a filesystem without hard
+    links, which is worth failing loudly at startup rather than quietly running
+    without a lock.
     """
     tmp = "%s.claim.%d" % (LOCK_PATH, os.getpid())
     try:
         with open(tmp, "wb") as fh:
-            fh.write(_encode(identity))
+            fh.write(json.dumps(identity, sort_keys=True).encode("utf-8"))
             fh.flush()
             os.fsync(fh.fileno())
         try:
@@ -391,8 +344,6 @@ def _claim(identity):
             return True
         except FileExistsError:
             return False
-        except (OSError, NotImplementedError):
-            return _claim_exclusive(identity)
     finally:
         try:
             os.remove(tmp)
@@ -407,18 +358,16 @@ def _drop_stale(entry):
     reclaimers can both read the same dead record; if one has already created a
     fresh lock by the time the other calls os.remove, that remove would delete
     the new holder's claim. Re-reading and comparing against the record we
-    judged dead catches that case and sends the loser round the loop again,
-    where it sees the live holder and refuses. It narrows the window to the
-    microseconds between this read and the remove; it does not close it, because
-    there is no compare-and-delete on either platform. See the module docstring.
+    judged dead catches that case and sends the loser round the loop again, where
+    it sees the live holder and refuses. What that leaves open is in the module
+    docstring.
 
     Failing to remove is never fatal, only "not ours to remove, go round again".
     FileNotFoundError is another reclaimer having won. PermissionError is Windows
     declining to unlink a file somebody has open -- and health.py opens
     relay.lock on every probe, so a relay starting against a stale lock races
-    the probe by default. That is the common case here, not a rare one: it was
-    unhandled, and it killed relay.py at startup with a traceback instead of
-    reclaiming the lock it had already decided was dead.
+    the probe by default. That was unhandled, and it killed relay.py at startup
+    with a traceback instead of reclaiming a lock it had already called dead.
     """
     current, present = _lock_view()
     if not present or current is None or current != entry:
@@ -465,12 +414,9 @@ def acquire_lock():
                 continue
             raise LockHeld(None, LOCK_PATH)
         if entry is None:
-            # Present, unreadable: a claim caught mid-write, or a corrupt file.
-            # Wait a moment for an identity so the refusal can name the holder,
-            # then refuse unattributed rather than take a lock we cannot read.
-            if time.monotonic() < deadline:
-                time.sleep(CLAIM_POLL)
-                continue
+            # Present but unreadable. The claim is atomic, so nothing can be
+            # mid-write: this file is corrupt or truncated, and there is nothing
+            # to wait for. Refuse rather than take a lock we cannot read.
             raise LockHeld(None, LOCK_PATH)
         held, verifiable = assess(entry)
         if held:
