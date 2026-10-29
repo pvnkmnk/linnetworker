@@ -1,0 +1,22 @@
+# Committed by design: this file holds ciphertext only. The identity that
+# decrypts it is not in the repo.
+#
+# Note the layering: the relay's runtime environment comes from the gitignored
+# `relay.env` that `docker compose` reads, not from this file. fnox exists here
+# for the values that must never enter a compose file -- today that is one:
+#
+#   * GRAFANA_AUTH -- the live Grafana admin password, used by the `provision`
+#     profile only (the relay itself never reads it). Add it with:
+#
+#         fnox set -p age GRAFANA_AUTH
+#
+#     `GRAFANA_URL` is not secret and belongs in relay.env beside it.
+#
+# Nothing is set below on purpose: inventing a Grafana credential would produce
+# a config that looks configured and fails at provision time.
+
+[providers.age]
+type = "age"
+recipients = ["age1846shjkjn76w4fy9azpq55jpfeu4un9jl7q4rj9a42fl37tpm3ss0j2c6y"]
+
+[secrets]
