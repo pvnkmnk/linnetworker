@@ -1,0 +1,73 @@
+# linnetworker -- mise en place for this checkout.
+#
+# Scope discipline: this file declares the surface README.md already documents.
+# Every task is a one-line wrapper around a command that exists there; nothing is
+# moved here, and nothing here is required to run the relay.
+#
+# Two things this file deliberately does NOT declare:
+#
+#   * **[env]** -- the relay's knobs live in the git-ignored `relay.env`, which is
+#     what `docker compose` reads and which may hold `GRAFANA_AUTH`. Exporting the
+#     same names from mise would give one setting two owners, and the compose
+#     file's explicit `environment:` block would win anyway.
+#   * **[tools]** -- the code and all three suites are standard library only, and
+#     `ruff` is installed per CI run rather than pinned per checkout. A version
+#     invented here would be a claim the repo never made.
+#
+# `python`, not `python3`, in host tasks: the `python3` on this machine's PATH is
+# the Microsoft Store alias stub and exits 49. The container uses `python3`
+# because that is the interpreter the image actually has.
+
+[tasks.test]
+description = "All three suites, in the order README lists them (98 tests; 2 skip off Windows)"
+run = "python -m unittest relay_lock_test event_log_test relay_test"
+
+[tasks."test:lock"]
+description = "relay_lock_test only: the claim, the holder identity, cross-namespace liveness"
+run = "python -m unittest relay_lock_test"
+
+[tasks."test:log"]
+description = "event_log_test only: the caps, rotation, the orphan sweep (cheapest while editing)"
+run = "python -m unittest event_log_test"
+
+[tasks."test:relay"]
+description = "relay_test only: the ingest path end to end (dominates total runtime)"
+run = "python -m unittest relay_test"
+
+[tasks.lint]
+description = "ruff with the CI selection (E,F) -- keep this identical to .github/workflows/ci.yml"
+run = "ruff check --select E,F ."
+
+[tasks.up]
+description = "Start the relay container (build included)"
+run = "docker compose up -d --build"
+
+[tasks.down]
+description = "Clean stop: SIGTERM -> finally -> relay.lock released"
+run = "docker compose stop"
+
+[tasks.ps]
+description = "Container status, including health"
+run = "docker compose ps"
+
+[tasks.logs]
+description = "Follow the relay's stdout"
+run = "docker logs -f cf-worker-relay"
+
+[tasks.health]
+description = "JSON health probe -- run it inside the relay's namespace, where the lock's pid means something"
+# Git Bash rewrites `/app/health.py` into a Windows path; prefix this with
+# `MSYS_NO_PATHCONV=1` when running it from there. A host-side probe still
+# answers, but reports `lock_verifiable: false` because a pid is only meaningful
+# inside the namespace that issued it.
+run = "docker exec cf-worker-relay python3 /app/health.py"
+
+[tasks.relay]
+description = "Foreground run; stop the service first or the lock refuses a second relay"
+# Needs RELAY_WORKER_DIR pointed at the Worker's checkout, e.g.
+#   RELAY_WORKER_DIR=../djinn-netrunner/ops/linear-webhook mise run relay -- --seconds 60
+run = "python relay.py"
+
+[tasks.provision]
+description = "One-shot datasource + dashboard creation; needs GRAFANA_AUTH in relay.env"
+run = "docker compose --profile provision run --rm provisioner"
